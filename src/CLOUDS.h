@@ -12,6 +12,7 @@
 #include "clouds/dsp/fx/fx_engine.h"
 #include "clouds/dsp/fx/pitch_shifter.h"
 #include "clouds/dsp/fx/reverb.h"
+#include "clouds/dsp/fx/oliverb.h"
 
 #include "clouds/dsp/grain.h"
 #include "clouds/dsp/granular_processor.h"

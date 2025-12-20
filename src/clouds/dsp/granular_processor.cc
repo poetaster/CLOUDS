@@ -30,7 +30,7 @@
 
 #include <cstring>
 
-//#include "clouds/drivers/debug_pin.h"
+
 
 #include "stmlib/dsp/parameter_interpolator.h"
 #include "stmlib/utils/buffer_allocator.h"
@@ -62,9 +62,6 @@ void GranularProcessor::Init(
   previous_playback_mode_ = PLAYBACK_MODE_LAST;
   reset_buffers_ = true;
   dry_wet_ = 0.0f;
-    
-    sr_ = 48000.f;      // vb, init sample rate
-    
 }
 
 void GranularProcessor::ResetFilters() {
@@ -81,15 +78,16 @@ void GranularProcessor::ProcessGranular(
     size_t size) {
   // At the exception of the spectral mode, all modes require the incoming
   // audio signal to be written to the recording buffer.
-  if (playback_mode_ != PLAYBACK_MODE_SPECTRAL) {
+  if (playback_mode_ != PLAYBACK_MODE_SPECTRAL &&
+      playback_mode_ != PLAYBACK_MODE_RESONESTOR) {
     const float* input_samples = &input[0].l;
+    const bool play = !parameters_.freeze ||
+      playback_mode_ == PLAYBACK_MODE_OLIVERB;
     for (int32_t i = 0; i < num_channels_; ++i) {
       if (resolution() == 8) {
-        buffer_8_[i].WriteFade(
-            &input_samples[i], size, 2, !parameters_.freeze);
+        buffer_8_[i].WriteFade(&input_samples[i], size, 2, play);
       } else {
-        buffer_16_[i].WriteFade(
-            &input_samples[i], size, 2, !parameters_.freeze);
+        buffer_16_[i].WriteFade(&input_samples[i], size, 2, play);
       }
     }
   }
@@ -98,22 +96,20 @@ void GranularProcessor::ProcessGranular(
     case PLAYBACK_MODE_GRANULAR:
       // In Granular mode, DENSITY is a meta parameter.
       parameters_.granular.use_deterministic_seed = parameters_.density < 0.5f;
-          /*
       if (parameters_.density >= 0.53f) {
         parameters_.granular.overlap = (parameters_.density - 0.53f) * 2.12f;
       } else if (parameters_.density <= 0.47f) {
         parameters_.granular.overlap = (0.47f - parameters_.density) * 2.12f;
       } else {
         parameters_.granular.overlap = 0.0f;
-      }*/
-          
-          //make the dead zone narrower, vb
-          if (parameters_.density >= 0.5f) {
-              parameters_.granular.overlap = (parameters_.density - 0.5f) * 2.0f;
-          } else if (parameters_.density < 0.5f) {
-              parameters_.granular.overlap = (0.5f - parameters_.density) * 2.0f;
-          }
-          
+      }
+
+#ifdef CLOUDS_QUANTIZE_SEMITONES
+      // Quantize pitch to closest semitone
+      if (parameters_.pitch < 0.5f) parameters_.pitch -= 0.5f;
+      parameters_.pitch = static_cast<int>(parameters_.pitch + 0.5f);
+#endif
+
       // And TEXTURE too.
       parameters_.granular.window_shape = parameters_.texture < 0.75f
           ? parameters_.texture * 1.333f : 1.0f;
@@ -163,67 +159,178 @@ void GranularProcessor::ProcessGranular(
       }
       break;
 
+    case PLAYBACK_MODE_OLIVERB:
+      {
+
+        // Pre-delay, controlled by position or tap tempo sync
+        Parameters p = {
+          ws_player_.synchronized() ?
+          parameters_.position :
+          parameters_.position * 0.25f, // position;
+          0.1f, // size;
+          0.0f, // pitch;
+          0.0f, // density;
+          0.5f, // texture;
+          1.0f, // dry_wet;
+          0.0f, // stereo_spread;
+          0.0f, // feedback;
+          0.0f, // reverb;
+          false, // freeze;
+          parameters_.trigger, // trigger;
+          false // gate;
+        };
+
+        if (resolution() == 8) {
+          ws_player_.Play(buffer_8_, p, &output[0].l, size);
+        } else {
+          ws_player_.Play(buffer_16_, p, &output[0].l, size);
+        }
+
+        // Settings of the reverb
+        oliverb_.set_diffusion(0.3f + 0.5f * parameters_.stereo_spread);
+        oliverb_.set_size(0.05f + 0.94f * parameters_.size);
+        oliverb_.set_mod_rate(parameters_.feedback);
+        oliverb_.set_mod_amount(parameters_.reverb * 300.0f);
+        oliverb_.set_ratio(SemitonesToRatio(parameters_.pitch));
+
+        float x = parameters_.pitch;
+        const float limit = 0.7f;
+        const float slew = 0.4f;
+
+        float wet =
+          x < -limit ? 1.0f :
+          x < -limit + slew ? 1.0f - (x + limit) / slew:
+          x < limit - slew ? 0.0f :
+          x < limit ? 1.0f + (x - limit) / slew:
+          1.0f;
+        oliverb_.set_pitch_shift_amount(wet);
+
+        if (parameters_.freeze) {
+          oliverb_.set_input_gain(0.0f);
+          oliverb_.set_decay(1.0f);
+          oliverb_.set_lp(1.0f);
+          oliverb_.set_hp(0.0f);
+        } else {
+          oliverb_.set_decay(parameters_.density * 1.3f
+                           + 0.15f * abs(parameters_.pitch) / 24.0f);
+          oliverb_.set_input_gain(0.5f);
+          float lp = parameters_.texture < 0.5f ?
+            parameters_.texture * 2.0f : 1.0f;
+          float hp = parameters_.texture > 0.5f ?
+            (parameters_.texture - 0.5f) * 2.0f : 0.0f;
+          oliverb_.set_lp(0.03f + 0.9f * lp);
+          oliverb_.set_hp(0.01f + 0.2f * hp); // the small offset
+                                                  // gets rid of
+                                                  // feedback of large
+                                                  // DC offset.
+        }
+        oliverb_.Process(output, size);
+      }
+      break;
+
+  case PLAYBACK_MODE_RESONESTOR:
+    {
+      copy(&input[0], &input[size], &output[0]);
+
+      resonestor_.set_pitch(parameters_.pitch);
+      resonestor_.set_chord(parameters_.size);
+      resonestor_.set_trigger(parameters_.trigger);
+      resonestor_.set_burst_damp(parameters_.position);
+      resonestor_.set_burst_comb((1.0f - parameters_.position));
+      resonestor_.set_burst_duration((1.0f - parameters_.position));
+      resonestor_.set_spread_amount(parameters_.reverb);
+      resonestor_.set_stereo(parameters_.stereo_spread < 0.5f ? 0.0f :
+        (parameters_.stereo_spread - 0.5f) * 2.0f);
+      resonestor_.set_separation(parameters_.stereo_spread > 0.5f ? 0.0f :
+                                (0.5f - parameters_.stereo_spread) * 2.0f);
+      resonestor_.set_freeze(parameters_.freeze);
+      resonestor_.set_harmonicity(1.0f - (parameters_.feedback * 0.5f));
+      resonestor_.set_distortion(parameters_.dry_wet);
+
+      float t = parameters_.texture;
+      if (t < 0.5f) {
+        resonestor_.set_narrow(0.001f);
+        float l = 1.0f - (0.5f - t) / 0.5f;
+        l = l * (1.0f - 0.08f) + 0.08f;
+        resonestor_.set_damp(l * l);
+      } else {
+        resonestor_.set_damp(1.0f);
+        float n = (t - 0.5f) / 0.5f * 1.35f;
+        n *= n * n * n;
+        resonestor_.set_narrow(0.001f + n * n * 0.6f);
+      }
+
+      float d = (parameters_.density - 0.05f) / 0.9f;
+      if (d < 0.0f) d = 0.0f;
+      d *= d * d;
+      d *= d * d;
+      d *= d * d;
+      resonestor_.set_feedback(d * 20.0f);
+
+      resonestor_.Process(output, size);
+    }
+    break;
+
     default:
       break;
   }
 }
-/*
+
 void GranularProcessor::Process(
     ShortFrame* input,
     ShortFrame* output,
-    size_t size) {*/
-void GranularProcessor::Process(
-                                    FloatFrame* in,
-                                    FloatFrame* out_,
-                                    size_t size) {
+    size_t size) {
   // TIC
-//  if (bypass_) {
-////    copy(&input[0], &input[size], &output[0]);
-//      copy(&in_[0], &in_[size], &out_[0]);
-//    return;
-//  }
+  if (bypass_) {
+    copy(&input[0], &input[size], &output[0]);
+    return;
+  }
   
   if (silence_ || reset_buffers_ ||
       previous_playback_mode_ != playback_mode_) {
-//    short* output_samples = &output[0].l;
-//    fill(&output_samples[0], &output_samples[size << 1], 0);
-      float* output_samples = &out_[0].l;
-      fill(&output_samples[0], &output_samples[size << 1], 0);
-      return;
+    short* output_samples = &output[0].l;
+    fill(&output_samples[0], &output_samples[size << 1], 0);
+    return;
   }
-  /*
+  
   // Convert input buffers to float, and mixdown for mono processing.
   for (size_t i = 0; i < size; ++i) {
     in_[i].l = static_cast<float>(input[i].l) / 32768.0f;
     in_[i].r = static_cast<float>(input[i].r) / 32768.0f;
-  }*/
-    
-    // vb, we have to copy input signal!
-    copy(&in[0], &in[size], &in_[0]);
-    
-    // vb, we always use stereo input
-//  if (num_channels_ == 1) {
-//    for (size_t i = 0; i < size; ++i) {
-//      in_[i].l = (in_[i].l + in_[i].r) * 0.5f;
-//      in_[i].r = in_[i].l;
-//    }
-//  }
+  }
+
+  if (num_channels_ == 1) {
+    for (size_t i = 0; i < size; ++i) {
+      float xfade = 0.5f;
+      // in mono delay modes, stereo spread controls input crossfade
+      if (playback_mode_ == PLAYBACK_MODE_LOOPING_DELAY ||
+          playback_mode_ == PLAYBACK_MODE_STRETCH)
+        xfade = parameters_.stereo_spread;
+
+      in_[i].l = in_[i].l * (1.0f - xfade) + in_[i].r * xfade;
+      in_[i].r = in_[i].l;
+    }
+  }
   
   // Apply feedback, with high-pass filtering to prevent build-ups at very
   // low frequencies (causing large DC swings).
-  ONE_POLE(freeze_lp_, parameters_.freeze ? 1.0f : 0.0f, 0.0005f)
   float feedback = parameters_.feedback;
-  float cutoff = (20.0f + 100.0f * feedback * feedback) / sample_rate();
-  fb_filter_[0].set_f_q<FREQUENCY_FAST>(cutoff, 1.0f);
-  fb_filter_[1].set(fb_filter_[0]);
-  fb_filter_[0].Process<FILTER_MODE_HIGH_PASS>(&fb_[0].l, &fb_[0].l, size, 2);
-  fb_filter_[1].Process<FILTER_MODE_HIGH_PASS>(&fb_[0].r, &fb_[0].r, size, 2);
-  float fb_gain = feedback * (1.0f - freeze_lp_);
-  for (size_t i = 0; i < size; ++i) {
-    in_[i].l += fb_gain * (
-        SoftLimit(fb_gain * 1.4f * fb_[i].l + in_[i].l) - in_[i].l);
-    in_[i].r += fb_gain * (
-        SoftLimit(fb_gain * 1.4f * fb_[i].r + in_[i].r) - in_[i].r);
+
+  if (playback_mode_ != PLAYBACK_MODE_OLIVERB &&
+      playback_mode_ != PLAYBACK_MODE_RESONESTOR) {
+    ONE_POLE(freeze_lp_, parameters_.freeze ? 1.0f : 0.0f, 0.0005f)
+    float cutoff = (20.0f + 100.0f * feedback * feedback) / sample_rate();
+    fb_filter_[0].set_f_q<FREQUENCY_FAST>(cutoff, 0.75f);
+    fb_filter_[1].set(fb_filter_[0]);
+    fb_filter_[0].Process<FILTER_MODE_HIGH_PASS>(&fb_[0].l, &fb_[0].l, size, 2);
+    fb_filter_[1].Process<FILTER_MODE_HIGH_PASS>(&fb_[0].r, &fb_[0].r, size, 2);
+    float fb_gain = feedback * (2.0f - feedback) * (1.0f - freeze_lp_);
+    for (size_t i = 0; i < size; ++i) {
+      in_[i].l += fb_gain * (
+                             SoftLimit(fb_gain * 1.4f * fb_[i].l + in_[i].l) - in_[i].l);
+      in_[i].r += fb_gain * (
+                             SoftLimit(fb_gain * 1.4f * fb_[i].r + in_[i].r) - in_[i].r);
+    }
   }
   
   if (low_fidelity_) {
@@ -236,7 +343,9 @@ void GranularProcessor::Process(
   }
   
   // Diffusion and pitch-shifting post-processings.
-  if (playback_mode_ != PLAYBACK_MODE_SPECTRAL) {
+  if (playback_mode_ != PLAYBACK_MODE_SPECTRAL &&
+      playback_mode_ != PLAYBACK_MODE_OLIVERB &&
+      playback_mode_ != PLAYBACK_MODE_RESONESTOR) {
     float texture = parameters_.texture;
     float diffusion = playback_mode_ == PLAYBACK_MODE_GRANULAR 
         ? texture > 0.75f ? (texture - 0.75f) * 4.0f : 0.0f
@@ -244,11 +353,21 @@ void GranularProcessor::Process(
     diffuser_.set_amount(diffusion);
     diffuser_.Process(out_, size);
   }
-  
+
   if (playback_mode_ == PLAYBACK_MODE_LOOPING_DELAY &&
       (!parameters_.freeze || looper_.synchronized())) {
     pitch_shifter_.set_ratio(SemitonesToRatio(parameters_.pitch));
     pitch_shifter_.set_size(parameters_.size);
+    float x = parameters_.pitch;
+    const float limit = 0.7f;
+    const float slew = 0.4f;
+    float wet =
+      x < -limit ? 1.0f :
+      x < -limit + slew ? 1.0f - (x + limit) / slew:
+      x < limit - slew ? 0.0f :
+      x < limit ? 1.0f + (x - limit) / slew:
+      1.0f;
+    pitch_shifter_.set_dry_wet(wet);
     pitch_shifter_.Process(out_, size);
   }
   
@@ -262,8 +381,8 @@ void GranularProcessor::Process(
         (cutoff < 0.5f ? -0.5f : cutoff - 1.0f) * 216.0f);
     CONSTRAIN(lp_cutoff, 0.0f, 0.499f);
     CONSTRAIN(hp_cutoff, 0.0f, 0.499f);
-    float lpq = 1.0f + 3.0f * (1.0f - feedback) * (0.5f - lp_cutoff);
-    lp_filter_[0].set_f_q<FREQUENCY_FAST>(lp_cutoff, lpq);
+
+    lp_filter_[0].set_f_q<FREQUENCY_FAST>(lp_cutoff, 0.9f);
     lp_filter_[0].Process<FILTER_MODE_LOW_PASS>(
         &out_[0].l, &out_[0].l, size, 2);
 
@@ -271,7 +390,7 @@ void GranularProcessor::Process(
     lp_filter_[1].Process<FILTER_MODE_LOW_PASS>(
         &out_[0].r, &out_[0].r, size, 2);
 
-    hp_filter_[0].set_f_q<FREQUENCY_FAST>(hp_cutoff, 1.0f);
+    hp_filter_[0].set_f_q<FREQUENCY_FAST>(hp_cutoff, 0.9f);
     hp_filter_[0].Process<FILTER_MODE_HIGH_PASS>(
         &out_[0].l, &out_[0].l, size, 2);
 
@@ -282,40 +401,42 @@ void GranularProcessor::Process(
   
   // This is what is fed back. Reverb is not fed back.
   copy(&out_[0], &out_[size], &fb_[0]);
-  
-  // Apply reverb.
-  float reverb_amount = parameters_.reverb * 0.95f;
-  reverb_amount += feedback * (2.0f - feedback) * freeze_lp_;
-  CONSTRAIN(reverb_amount, 0.0f, 1.0f);
-  
-  reverb_.set_amount(reverb_amount * 0.54f);
-  reverb_.set_diffusion(0.7f);
-  reverb_.set_time(0.35f + 0.63f * reverb_amount);
-  reverb_.set_input_gain(0.2f);
-  reverb_.set_lp(0.6f + 0.37f * feedback);
-  reverb_.Process(out_, size);
-  
+
   const float post_gain = 1.2f;
-  ParameterInterpolator dry_wet_mod(&dry_wet_, parameters_.dry_wet, size);
-  for (size_t i = 0; i < size; ++i) {
-    float dry_wet = dry_wet_mod.Next();
-    float fade_in = Interpolate(lut_xfade_in, dry_wet, 16.0f);
-    float fade_out = Interpolate(lut_xfade_out, dry_wet, 16.0f);
-      /*
-    float l = static_cast<float>(input[i].l) / 32768.0f * fade_out;
-    float r = static_cast<float>(input[i].r) / 32768.0f * fade_out;
-    l += out_[i].l * post_gain * fade_in;
-    r += out_[i].r * post_gain * fade_in;
-    output[i].l = SoftConvert(l);
-    output[i].r = SoftConvert(r);
-       */
-      float l = in[i].l * fade_out;
-      float r = in[i].r * fade_out;
-      l += out_[i].l * post_gain * fade_in;
-      r += out_[i].r * post_gain * fade_in;
-      out_[i].l = SoftLimit(l * 0.5f);
-      out_[i].r = SoftLimit(r * 0.5f);
+
+  if (playback_mode_ != PLAYBACK_MODE_RESONESTOR) {
+    ParameterInterpolator dry_wet_mod(&dry_wet_, parameters_.dry_wet, size);
+    for (size_t i = 0; i < size; ++i) {
+      float dry_wet = dry_wet_mod.Next();
+      float fade_in = Interpolate(lut_xfade_in, dry_wet, 16.0f);
+      float fade_out = Interpolate(lut_xfade_out, dry_wet, 16.0f);
+      float l = static_cast<float>(input[i].l) / 32768.0f;
+      float r = static_cast<float>(input[i].r) / 32768.0f;
+      out_[i].l = l * fade_out + out_[i].l * post_gain * fade_in;
+      out_[i].r = r * fade_out + out_[i].r * post_gain * fade_in;
+    }
   }
+
+  // Apply the simple post-processing reverb.
+  if (playback_mode_ != PLAYBACK_MODE_OLIVERB &&
+      playback_mode_ != PLAYBACK_MODE_RESONESTOR) {
+    float reverb_amount = parameters_.reverb;
+
+    reverb_.set_amount(reverb_amount * 0.54f);
+    reverb_.set_diffusion(0.7f);
+    reverb_.set_time(0.35f + 0.63f * reverb_amount);
+    reverb_.set_input_gain(0.2f);
+    reverb_.set_lp(0.6f + 0.37f * feedback);
+
+    reverb_.Process(out_, size);
+  }
+
+  for (size_t i = 0; i < size; ++i) {
+    output[i].l = SoftConvert(out_[i].l);
+    output[i].r = SoftConvert(out_[i].r);
+  }
+
+  // TOC
 }
 
 void GranularProcessor::PreparePersistentData() {
@@ -402,8 +523,12 @@ bool GranularProcessor::LoadPersistentData(const uint32_t* data) {
 void GranularProcessor::Prepare() {
   bool playback_mode_changed = previous_playback_mode_ != playback_mode_;
   bool benign_change = previous_playback_mode_ != PLAYBACK_MODE_SPECTRAL
-      && playback_mode_ != PLAYBACK_MODE_SPECTRAL
-      && previous_playback_mode_ != PLAYBACK_MODE_LAST;
+    && playback_mode_ != PLAYBACK_MODE_SPECTRAL
+    && playback_mode_ != PLAYBACK_MODE_RESONESTOR
+    && previous_playback_mode_ != PLAYBACK_MODE_RESONESTOR
+    && playback_mode_ != PLAYBACK_MODE_OLIVERB
+    && previous_playback_mode_ != PLAYBACK_MODE_OLIVERB
+    && previous_playback_mode_ != PLAYBACK_MODE_LAST;
   
   if (!reset_buffers_ && playback_mode_changed && benign_change) {
     ResetFilters();
@@ -414,7 +539,7 @@ void GranularProcessor::Prepare() {
   if ((playback_mode_changed && !benign_change) || reset_buffers_) {
     parameters_.freeze = false;
   }
-  
+
   if (reset_buffers_ || (playback_mode_changed && !benign_change)) {
     void* buffer[2];
     size_t buffer_size[2];
@@ -443,8 +568,14 @@ void GranularProcessor::Prepare() {
 
     BufferAllocator allocator(workspace, workspace_size);
     diffuser_.Init(allocator.Allocate<float>(2048));
-    reverb_.Init(allocator.Allocate<uint16_t>(16384));
-    
+
+    uint16_t* reverb_buffer = allocator.Allocate<uint16_t>(16384);
+    if (playback_mode_ == PLAYBACK_MODE_OLIVERB) {
+      oliverb_.Init(reverb_buffer);
+    } else {
+      reverb_.Init(reverb_buffer);
+    }
+
     size_t correlator_block_size = (kMaxWSOLASize / 32) + 2;
     uint32_t* correlator_data = allocator.Allocate<uint32_t>(
         correlator_block_size * 3);
@@ -458,6 +589,9 @@ void GranularProcessor::Prepare() {
           buffer, buffer_size,
           lut_sine_window_4096, 4096,
           num_channels_, resolution(), sr);
+    } else if (playback_mode_ == PLAYBACK_MODE_RESONESTOR) {
+      float* buf = (float*)buffer[0];
+      resonestor_.Init(buf);
     } else {
       for (int32_t i = 0; i < num_channels_; ++i) {
         if (resolution() == 8) {
@@ -472,8 +606,8 @@ void GranularProcessor::Prepare() {
               tail_buffer_[i]);
         }
       }
-      int32_t num_grains = (num_channels_ == 1 ? 40 : 32) * \
-          (low_fidelity_ ? 23 : 16) >> 4;
+      int32_t num_grains = (num_channels_ == 1 ? 32 : 26) * \
+          (low_fidelity_ ? 20 : 16) >> 4;
       player_.Init(num_channels_, num_grains);
       ws_player_.Init(&correlator_, num_channels_);
       looper_.Init(num_channels_);
@@ -484,7 +618,8 @@ void GranularProcessor::Prepare() {
   
   if (playback_mode_ == PLAYBACK_MODE_SPECTRAL) {
     phase_vocoder_.Buffer();
-  } else if (playback_mode_ == PLAYBACK_MODE_STRETCH) {
+  } else if (playback_mode_ == PLAYBACK_MODE_STRETCH ||
+             playback_mode_ == PLAYBACK_MODE_OLIVERB) {
     if (resolution() == 8) {
       ws_player_.LoadCorrelator(buffer_8_);
     } else {

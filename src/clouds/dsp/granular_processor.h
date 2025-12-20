@@ -37,6 +37,8 @@
 #include "clouds/dsp/fx/diffuser.h"
 #include "clouds/dsp/fx/pitch_shifter.h"
 #include "clouds/dsp/fx/reverb.h"
+#include "clouds/dsp/resonestor.h"
+#include "clouds/dsp/fx/oliverb.h"
 #include "clouds/dsp/granular_processor.h"
 #include "clouds/dsp/granular_sample_player.h"
 #include "clouds/dsp/looping_sample_player.h"
@@ -53,6 +55,8 @@ enum PlaybackMode {
   PLAYBACK_MODE_STRETCH,
   PLAYBACK_MODE_LOOPING_DELAY,
   PLAYBACK_MODE_SPECTRAL,
+  PLAYBACK_MODE_OLIVERB,
+  PLAYBACK_MODE_RESONESTOR,
   PLAYBACK_MODE_LAST
 };
 
@@ -81,9 +85,7 @@ class GranularProcessor {
       void* small_buffer,
       size_t small_buffer_size);
 
-    // work directly with float frames not shorts
-  //void Process(ShortFrame* input, ShortFrame* output, size_t size);
-  void Process(FloatFrame* input, FloatFrame* output, size_t size);
+  void Process(ShortFrame* input, ShortFrame* output, size_t size);
   void Prepare();
   
   inline Parameters* mutable_parameters() {
@@ -97,13 +99,16 @@ class GranularProcessor {
   inline void ToggleFreeze() {
     parameters_.freeze = !parameters_.freeze;
   }
-  
-  inline void set_freeze(bool freeze) {
-    parameters_.freeze = freeze;
+  inline void ToggleReverse() {
+    parameters_.granular.reverse = !parameters_.granular.reverse;
   }
 
   inline bool frozen() const {
     return parameters_.freeze;
+  }
+
+  inline bool reversed() const {
+    return parameters_.granular.reverse;
   }
 
   inline void set_silence(bool silence) {
@@ -145,38 +150,19 @@ class GranularProcessor {
     if (low_fidelity_) quality |= 2;
     return quality;
   }
-    
-    // vb: make sample rate settable
-    void set_sample_rate(float sr) {
-        sr_ = sr;
-    }
   
   void GetPersistentData(PersistentBlock* block, size_t *num_blocks);
   bool LoadPersistentData(const uint32_t* data);
   void PreparePersistentData();
-    
-    
-    // vb, do we still need these?
-    AudioBuffer<RESOLUTION_16_BIT>* GetAudioBuf16() {
-        return buffer_16_;
-    }
-    AudioBuffer<RESOLUTION_8_BIT_MU_LAW>* GetAudioBuf8() {
-        return buffer_8_;
-    }
-    
-    
-    // vb: make this public
-    inline int32_t resolution() const {
-        return low_fidelity_ ? 8 : 16;
-    }
 
  private:
+  inline int32_t resolution() const {
+    return low_fidelity_ ? 8 : 16;
+  }
 
   inline float sample_rate() const {
-    //return 32000.0f / \       // vb, original sr fixed to 32kHz
-      //  (low_fidelity_ ? kDownsamplingFactor : 1);
-      return sr_ / \
-      (low_fidelity_ ? kDownsamplingFactor : 1);
+    return 32000.0f / \
+        (low_fidelity_ ? kDownsamplingFactor : 1);
   }
      
   void ResetFilters();
@@ -192,7 +178,6 @@ class GranularProcessor {
   bool reset_buffers_;
   float freeze_lp_;
   float dry_wet_;
-    float sr_;          //vb
   
   void* buffer_[2];
   size_t buffer_size_[2];
@@ -206,6 +191,8 @@ class GranularProcessor {
   
   Diffuser diffuser_;
   Reverb reverb_;
+  Oliverb oliverb_;
+  Resonestor resonestor_;
   PitchShifter pitch_shifter_;
   stmlib::Svf fb_filter_[2];
   stmlib::Svf hp_filter_[2];
@@ -217,7 +204,7 @@ class GranularProcessor {
   FloatFrame in_[kMaxBlockSize];
   FloatFrame in_downsampled_[kMaxBlockSize / kDownsamplingFactor];
   FloatFrame out_downsampled_[kMaxBlockSize / kDownsamplingFactor];
-  //FloatFrame out_[kMaxBlockSize];
+  FloatFrame out_[kMaxBlockSize];
   FloatFrame fb_[kMaxBlockSize];
   
   int16_t tail_buffer_[2][256];

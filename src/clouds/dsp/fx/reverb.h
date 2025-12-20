@@ -8,10 +8,10 @@
 // to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 // copies of the Software, and to permit persons to whom the Software is
 // furnished to do so, subject to the following conditions:
-// 
+//
 // The above copyright notice and this permission notice shall be included in
 // all copies or substantial portions of the Software.
-// 
+//
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -19,7 +19,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
-// 
+//
 // See http://creativecommons.org/licenses/MIT/ for more information.
 //
 // -----------------------------------------------------------------------------
@@ -39,7 +39,7 @@ class Reverb {
  public:
   Reverb() { }
   ~Reverb() { }
-  
+
   void Init(uint16_t* buffer) {
     engine_.Init(buffer);
     engine_.SetLFOFrequency(LFO_1, 0.5f / 32000.0f);
@@ -47,7 +47,7 @@ class Reverb {
     lp_ = 0.7f;
     diffusion_ = 0.625f;
   }
-  
+
   void Process(FloatFrame* in_out, size_t size) {
     // This is the Griesinger topology described in the Dattorro paper
     // (4 AP diffusers on the input, then a loop of 2x 2AP+1Delay).
@@ -88,11 +88,11 @@ class Reverb {
       float wet;
       float apout = 0.0f;
       engine_.Start(&c);
-      
+
       // Smear AP1 inside the loop.
       c.Interpolate(ap1, 10.0f, LFO_1, 60.0f, 1.0f);
       c.Write(ap1, 100, 0.0f);
-      
+
       c.Read(in_out->l + in_out->r, gain);
 
       // Diffuse through 4 allpasses.
@@ -105,7 +105,7 @@ class Reverb {
       c.Read(ap4 TAIL, kap);
       c.WriteAllPass(ap4, -kap);
       c.Write(apout);
-      
+
       // Main reverb loop.
       c.Load(apout);
       c.Interpolate(del2, 4680.0f, LFO_2, 100.0f, krt);
@@ -131,18 +131,18 @@ class Reverb {
       c.Write(wet, 0.0f);
 
       in_out->r += (wet - in_out->r) * amount;
-      
+
       ++in_out;
     }
-    
+
     lp_decay_1_ = lp_1;
     lp_decay_2_ = lp_2;
   }
-  
+
   inline void set_amount(float amount) {
     amount_ = amount;
   }
-  
+
   inline void set_input_gain(float input_gain) {
     input_gain_ = input_gain;
   }
@@ -150,28 +150,28 @@ class Reverb {
   inline void set_time(float reverb_time) {
     reverb_time_ = reverb_time;
   }
-  
+
   inline void set_diffusion(float diffusion) {
     diffusion_ = diffusion;
   }
-  
+
   inline void set_lp(float lp) {
     lp_ = lp;
   }
-  
+
  private:
   typedef FxEngine<16384, FORMAT_12_BIT> E;
   E engine_;
-  
+
   float amount_;
   float input_gain_;
   float reverb_time_;
   float diffusion_;
   float lp_;
-  
+
   float lp_decay_1_;
   float lp_decay_2_;
-  
+
   DISALLOW_COPY_AND_ASSIGN(Reverb);
 };
 
